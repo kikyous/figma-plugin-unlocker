@@ -1,0 +1,27 @@
+[
+  {
+    "name": "debug-ready",
+    "pattern": "\"use strict\";var ([$A-Za-z_][$\\w]*)=Object\\.create;",
+    "replacement": "\"use strict\";if(process.env.FIGMA_PLUGIN_EXPERIMENT_DEBUG===\"1\")require(\"electron\").app.on(\"ready\",()=>console.error(\"[experiment] app ready\"));var {1}=Object.create;"
+  },
+  {
+    "name": "plugin-action",
+    "pattern": "function ([$A-Za-z_][$\\w]*)\\(([$A-Za-z_][$\\w]*),([$A-Za-z_][$\\w]*)\\)\\{let ([$A-Za-z_][$\\w]*)=\\3&&([$A-Za-z_][$\\w]*)\\.fromBrowserWindow\\(\\3\\);\\2&&\\2\\.pluginMenuAction&&\\4&&\\4\\.postMessageToActiveWebBinding\\(\"handlePluginMenuAction\",\\2\\.pluginMenuAction\\)\\}",
+    "replacement": "function {1}({2},{3}){let {4}={3}&&{5}.fromBrowserWindow({3});if({2}&&{2}.pluginMenuAction&&{4}){let __figmaPluginAction={2}.pluginMenuAction;if([\"run-local-plugin\",\"run-installed-plugin\",\"run-last\"].includes(__figmaPluginAction.type)){__figmaPluginAction={...__figmaPluginAction};delete __figmaPluginAction.showError}{4}.postMessageToActiveWebBinding(\"handlePluginMenuAction\",__figmaPluginAction)}}"
+  },
+  {
+    "name": "plugin-menu-enabled",
+    "pattern": "enabled:!([$A-Za-z_][$\\w]*)\\.disabled,pluginMenuAction:\\1\\.menuAction",
+    "replacement": "enabled:!{1}.disabled||[\"run-local-plugin\",\"run-installed-plugin\",\"run-last\"].includes({1}.menuAction?.type),pluginMenuAction:{1}.menuAction"
+  },
+  {
+    "name": "isolated-profile",
+    "pattern": "var ([$A-Za-z_][$\\w]*)=([$A-Za-z_][$\\w]*)\\.join\\(([$A-Za-z_][$\\w]*)\\.app\\.getPath\\(\"appData\"\\),\"Figma\"\\),",
+    "replacement": "var {1}=process.env.FIGMA_PLUGIN_EXPERIMENT_PROFILE||{2}.join({3}.app.getPath(\"appData\"),\"Figma\"),"
+  },
+  {
+    "name": "local-debugging",
+    "pattern": "process\\.env\\.FIGMA_TEST\\|\\|([$A-Za-z_][$\\w]*)\\.app\\.commandLine\\.removeSwitch\\(\"remote-debugging-port\"\\);",
+    "replacement": "process.env.FIGMA_PLUGIN_EXPERIMENT_DEBUG===\"1\"?({1}.app.commandLine.appendSwitch(\"remote-debugging-address\",\"127.0.0.1\"),{1}.app.commandLine.appendSwitch(\"remote-debugging-port\",\"19322\")):process.env.FIGMA_TEST||{1}.app.commandLine.removeSwitch(\"remote-debugging-port\");"
+  }
+]

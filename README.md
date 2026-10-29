@@ -10,9 +10,30 @@ Figma 在 view-only 模式下会省略插件列表，显示 “Unavailable in vi
 
 - macOS；需要系统自带的 `ditto` 和 `codesign`。
 - Python 3 和 Node.js；脚本使用标准库，无需安装项目依赖。
-- 当前仅适配已检查过的 Figma **126.11.7** 构建。桌面主脚本和网页 bundle 均固定校验 SHA-256；其他构建和架构未验证。
+- 桌面补丁使用共享规则匹配代码，不限制版本号或主脚本哈希。已在 Figma **126.10.13** 和 **126.11.7** 上验证下列行为；其他构建需要自行验证。
+
+本次检查使用 macOS x86_64 安装包，其他架构需通过 `--check` 确认主脚本是否匹配。
+
+| 版本 | 已验证 | 真实只读文件菜单 |
+| --- | --- | --- |
+| 126.10.13 | 规则匹配、菜单行为、打包、签名、启动、前端拦截 | 待验证 |
+| 126.11.7 | 规则匹配、菜单行为、打包、签名、启动、前端拦截 | 已验证入口可用 |
+
+启动与前端拦截在独立空白配置中测试，前端拦截通过在隔离的桌面 shell 渲染进程中加载公开 bundle 验证；不等同于已验证登录后的插件执行。
 
 Figma 可以独立更新网页代码。遇到未适配的 bundle，应用会继续加载原始脚本，并记录 `[plugin-experiment] frontend unchanged`，此时插件菜单补丁不会生效。
+
+## 兼容性检查
+
+检查本机安装包，不创建或修改应用副本：
+
+```bash
+python3 scripts/patch-figma.py --check
+```
+
+可用 `--source /path/to/Figma.app` 检查其他位置。输出包括版本、主脚本哈希和每条补丁的匹配数量；哈希仅供记录。规则不匹配时会输出 `compatible: false` 并返回退出码 `2`。规则匹配不能保证未知构建的实际行为正确。
+
+桌面应用版本和网页编辑器版本独立发布。`--check` 只检查桌面部分；网页部分仍在运行时单独核对 bundle 哈希。
 
 ## 使用
 
@@ -41,8 +62,8 @@ bash scripts/launch-experiment.sh
 
 补丁包括两个部分：
 
-- 桌面端：启用插件运行菜单项，转发时移除这些操作携带的 `showError` 标记。
-- 网页编辑器：应用内部通过 Electron 调试接口拦截指定的公开 `figma_app` bundle，修改五处插件相关的选择器和菜单判断，仅针对普通 Design 编辑器。
+- 桌面端：用 `patches/desktop-rules.json` 中的共享正则规则匹配压缩后的名称。每条规则必须恰好匹配一次。补丁启用插件运行菜单项，转发时移除这些操作携带的 `showError` 标记。
+- 网页编辑器：应用内部通过 Electron 调试接口拦截指定的公开 `figma_app` bundle，修改五处插件相关的选择器和菜单判断，仅针对普通 Design 编辑器。两个桌面版本共用这层前端补丁。
 
 插件选择器使用局部副本处理只读标记，不改变全局文档状态。其他编辑器模式和服务端权限保持原有行为。
 
@@ -58,13 +79,20 @@ bash scripts/launch-experiment.sh
 python3 scripts/patch-figma.py --refresh
 ```
 
-`--refresh` 会先核对现有副本是否与上次报告一致。可用 `--source` 和 `--output` 指定源应用与输出位置；自定义输出需要自行启动。
+`--refresh` 会先核对现有副本是否与上次报告一致。可用 `--source` 和 `--output` 指定源应用与输出位置；自定义输出需要自行启动。每个输出路径在 `.local/builds/` 下保存独立的主脚本与报告，因此可以分别构建多个版本，不会覆盖其他副本的重建依据。旧版默认报告格式仍可用于刷新原有副本。
 
-构建后执行桌面菜单验证：
+构建后执行桌面菜单验证和规则测试：
 
 ```bash
+python3 -m unittest discover -s tests -v
 node scripts/verify-menu-patch.mjs
 codesign --verify --deep --strict ".local/Figma Plugin Experiment.app"
+```
+
+自定义输出的构建报告会打印 `artifactDirectory`。可将对应的报告传给验证脚本，脚本会按该版本的菜单符号执行测试：
+
+```bash
+node scripts/verify-menu-patch.mjs .local/builds/<output-id>/patch-report.json
 ```
 
 前端验证需要下载已适配版本的公开网页脚本：
@@ -82,4 +110,10 @@ node scripts/verify-frontend-patch.mjs
 - 文档的 `isReadOnly` 仍为 `true`。
 - 原版 ASAR 哈希未变，副本 101 个 ASAR 条目及 macOS 签名通过校验。
 
-`.local/patch-report.json` 保存应用修改前后的哈希。生成的应用、下载的网页代码、本地配置与调试数据均位于被 Git 忽略的 `.local/` 中。
+默认输出的报告仍保存在 `.local/patch-report.json`，每个输出的独立报告保存在其 `artifactDirectory`。报告记录实际版本、源文件与修改后文件的哈希。生成的应用、安装包、下载的网页代码、本地配置与调试数据均位于被 Git 忽略的 `.local/` 中。
+
+## 适配其他版本
+
+共享规则使用正则捕获压缩后的名称；每条规则必须唯一匹配，否则构建会中止。如果代码结构改变，需要先适配共享规则。检查安装包后，还应验证归档、签名、菜单行为和启动；真实文件菜单与插件执行需要分别验证。
+
+新桌面版本可以复用前端补丁。若 Figma 更新了公开网页 bundle，则还需独立适配 `scripts/plugin-access-hook.cjs` 的前端规则和哈希。

@@ -1,47 +1,66 @@
 #!/usr/bin/env python3
-"""Build a reversible, version-pinned experiment from a local Figma install."""
+"""Build a reversible Figma copy using shared desktop patch rules."""
 import argparse
 import hashlib
 import json
 import pathlib
 import plistlib
+import re
 import struct
 import subprocess
 import tempfile
 
-VERSION = "126.11.7"
-MAIN_HASH = "dba0d4be01933d65a87888461df9d1de5a78ed90a56e24346a98bc65379910af"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+RULES_PATH = ROOT / "patches" / "desktop-rules.json"
 
-# These only affect the desktop menu's plugin execution actions.
-PATCHES = [
-    (
-        '"use strict";var Dee=Object.create;',
-        '"use strict";if(process.env.FIGMA_PLUGIN_EXPERIMENT_DEBUG==="1")require("electron").app.on("ready",()=>console.error("[experiment] app ready"));var Dee=Object.create;',
-    ),
-    (
-        'function Det(t,e){let r=e&&ae.fromBrowserWindow(e);t&&t.pluginMenuAction&&r&&r.postMessageToActiveWebBinding("handlePluginMenuAction",t.pluginMenuAction)}',
-        'function Det(t,e){let r=e&&ae.fromBrowserWindow(e);if(t&&t.pluginMenuAction&&r){let a=t.pluginMenuAction;if(["run-local-plugin","run-installed-plugin","run-last"].includes(a.type)){a={...a};delete a.showError}r.postMessageToActiveWebBinding("handlePluginMenuAction",a)}}',
-    ),
-    (
-        'enabled:!t.disabled,pluginMenuAction:t.menuAction',
-        'enabled:!t.disabled||["run-local-plugin","run-installed-plugin","run-last"].includes(t.menuAction?.type),pluginMenuAction:t.menuAction',
-    ),
-    # An explicit profile override lets us smoke-test without touching the running session.
-    (
-        'var Jl=Jt.join(Li.app.getPath("appData"),"Figma"),',
-        'var Jl=process.env.FIGMA_PLUGIN_EXPERIMENT_PROFILE||Jt.join(Li.app.getPath("appData"),"Figma"),',
-    ),
-    # Diagnostic access is opt-in and uses the loopback address.
-    (
-        'process.env.FIGMA_TEST||xe.app.commandLine.removeSwitch("remote-debugging-port");',
-        'process.env.FIGMA_PLUGIN_EXPERIMENT_DEBUG==="1"?(xe.app.commandLine.appendSwitch("remote-debugging-address","127.0.0.1"),xe.app.commandLine.appendSwitch("remote-debugging-port","19322")):process.env.FIGMA_TEST||xe.app.commandLine.removeSwitch("remote-debugging-port");',
-    ),
-]
+
+def load_rules(path=RULES_PATH):
+    rules = json.loads(path.read_text())
+    if not isinstance(rules, list) or not rules:
+        raise ValueError("Missing desktop patch rules")
+    names = set()
+    for rule in rules:
+        if (not isinstance(rule, dict) or not isinstance(rule.get("name"), str) or not rule["name"]
+                or rule["name"] in names or not isinstance(rule.get("pattern"), str)
+                or not rule["pattern"] or not isinstance(rule.get("replacement"), str)):
+            raise ValueError("Invalid or duplicate desktop patch rule")
+        try:
+            pattern = re.compile(rule["pattern"])
+        except re.error as error:
+            raise ValueError(f"Invalid patch pattern: {rule['name']}") from error
+        if pattern.match("") or any(int(n) < 1 or int(n) > pattern.groups
+                                     for n in re.findall(r"\{(\d+)\}", rule["replacement"])):
+            raise ValueError(f"Invalid patch replacement or empty match: {rule['name']}")
+        names.add(rule["name"])
+    return rules
+
+
+def matches_for(text, rule):
+    return list(re.finditer(rule["pattern"], text))
+
+
+def replacement_for(match, rule):
+    if rule["name"] == "plugin-action" and "__figmaPluginAction" in match.groups():
+        raise ValueError("Plugin action identifier conflicts with patch")
+    return re.sub(r"\{(\d+)\}", lambda m: match.group(int(m.group(1))), rule["replacement"])
 
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def patch_main(original, rules, hook_source):
+    modified = original.decode("utf8")
+    for patch in rules:
+        matches = matches_for(modified, patch)
+        if len(matches) != 1:
+            raise ValueError(f"Patch target is missing or ambiguous: {patch['name']}")
+        match = matches[0]
+        modified = modified[:match.start()] + replacement_for(match, patch) + modified[match.end():]
+    if not modified.startswith('"use strict";'):
+        raise ValueError("Unexpected main script prefix")
+    hook_install = "(()=>{const module={exports:{}};" + hook_source + ";module.exports.install()})();"
+    return modified.replace('"use strict";', '"use strict";' + hook_install, 1).encode("utf8")
 
 
 def read_asar(path):
@@ -116,6 +135,51 @@ def verify_archive(path):
     return checked
 
 
+def inspect_source(source, rules):
+    info = plistlib.loads((source / "Contents/Info.plist").read_bytes())
+    version = info["CFBundleShortVersionString"]
+    archive_path = source / "Contents/Resources/app.asar"
+    header, payload = read_asar(archive_path)
+    entry = header["files"].get("main.js")
+    if not entry or entry.get("unpacked"):
+        raise ValueError("Unsupported archive layout: expected app.asar with a packed main.js")
+    original = payload[int(entry["offset"]):int(entry["offset"]) + entry["size"]]
+    digest = sha(original)
+    checks = [
+        {"name": p["name"], "matches": len(matches_for(original.decode("utf8"), p))}
+        for p in rules
+    ]
+    verified = verify_archive(archive_path)
+    patch_error = None
+    try:
+        patch_main(original, rules, "")
+    except ValueError as error:
+        patch_error = str(error)
+    report = {
+        "source": str(source), "version": version, "sourceMainSha256": digest,
+        "sourceAsarSha256": sha(archive_path.read_bytes()),
+        "compatible": patch_error is None,
+        "patchChecks": checks, "patchError": patch_error, "verifiedAsarEntries": verified,
+        "frontend": "Checked separately against the pinned public web bundle at runtime.",
+    }
+    return report, info, header, payload, original
+
+
+def artifact_directory(output):
+    return ROOT / ".local" / "builds" / sha(str(output.resolve()).encode())[:16]
+
+
+def verify_refresh(output, artifacts):
+    report_path = artifacts / "patch-report.json"
+    if not report_path.exists():
+        # The first release wrote a single report. Accept it only for its exact output.
+        report_path = ROOT / ".local" / "patch-report.json"
+    previous = json.loads(report_path.read_text())
+    existing_archive = output / "Contents/Resources/app.asar"
+    if previous["output"] != str(output) or previous["patchedAsarSha256"] != sha(existing_archive.read_bytes()):
+        raise ValueError("Existing output does not match the previous experiment report")
+
+
 def run(*args):
     subprocess.run(args, check=True)
 
@@ -125,83 +189,80 @@ def main():
     parser.add_argument("--source", type=pathlib.Path, default=pathlib.Path("/Applications/Figma.app"))
     parser.add_argument("--output", type=pathlib.Path, default=ROOT / ".local" / "Figma Plugin Experiment.app")
     parser.add_argument("--refresh", action="store_true", help="Rebuild only a previously recorded experiment")
+    parser.add_argument("--check", action="store_true", help="Print a read-only desktop compatibility report; exit 2 if rules do not match")
     args = parser.parse_args()
-    source, output = args.source.resolve(), args.output.resolve()
-    if source == output or source in output.parents:
-        parser.error("Output must be outside the source app")
-    if output.exists():
-        if not args.refresh:
-            parser.error("Output exists; use --refresh only for a previously recorded experiment")
-        previous = json.loads((ROOT / ".local" / "patch-report.json").read_text())
-        existing_archive = output / "Contents/Resources/app.asar"
-        if previous["output"] != str(output) or previous["patchedAsarSha256"] != sha(existing_archive.read_bytes()):
-            parser.error("Existing output does not match the previous experiment report")
-    plist_path = source / "Contents/Info.plist"
-    info = plistlib.loads(plist_path.read_bytes())
-    if info["CFBundleShortVersionString"] != VERSION:
-        parser.error(f"Only Figma {VERSION} is supported; refusing to guess at another build")
-    archive_path = source / "Contents/Resources/app.asar"
-    original_archive_hash = sha(archive_path.read_bytes())
-    header, payload = read_asar(archive_path)
-    entry = header["files"]["main.js"]
-    original_main = payload[int(entry["offset"]):int(entry["offset"]) + entry["size"]]
-    if sha(original_main) != MAIN_HASH:
-        parser.error("Source main.js does not match the inspected build")
-    original_main_path = ROOT / ".local" / "original-main.js"
-    original_main_path.parent.mkdir(parents=True, exist_ok=True)
-    original_main_path.write_bytes(original_main)
-    modified = original_main.decode()
-    for old, new in PATCHES:
-        if modified.count(old) != 1:
-            raise ValueError("Patch target is missing or ambiguous")
-        modified = modified.replace(old, new)
-    hook_source = (ROOT / "scripts" / "plugin-access-hook.cjs").read_text()
-    hook_install = "(()=>{const module={exports:{}};" + hook_source + ";module.exports.install()})();"
-    if not modified.startswith('"use strict";'):
-        raise ValueError("Unexpected main script prefix")
-    modified = modified.replace('"use strict";', '"use strict";' + hook_install, 1)
-    modified_bytes = modified.encode()
-    archive, header_hash = replace_main(header, payload, modified_bytes)
-    with tempfile.TemporaryDirectory(prefix="figma-plugin-patch-") as temp:
-        temp = pathlib.Path(temp)
-        js = temp / "main.js"
-        js.write_bytes(modified_bytes)
-        run("node", "--check", str(js))
-        output.parent.mkdir(parents=True, exist_ok=True)
-        if not output.exists():
-            print(f"Copying {source} to {output}", flush=True)
-            run("ditto", str(source), str(output))
-        destination_archive = output / "Contents/Resources/app.asar"
-        destination_archive.write_bytes(archive)
-        checked = verify_archive(destination_archive)
-        info["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"] = header_hash
-        info["CFBundleIdentifier"] = "local.figma.PluginExperiment"
-        info["CFBundleDisplayName"] = "Figma Plugin Experiment"
-        (output / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
-        ent_result = subprocess.run(
-            ["codesign", "-d", "--entitlements", ":-", str(source)],
-            check=True, capture_output=True,
-        )
-        entitlements = plistlib.loads(ent_result.stdout)
-        # Ad-hoc signatures cannot satisfy the vendor's library team identity.
-        entitlements["com.apple.security.cs.disable-library-validation"] = True
-        ent_path = temp / "entitlements.plist"
-        ent_path.write_bytes(plistlib.dumps(entitlements))
-        run("codesign", "--force", "--deep", "--sign", "-", "--options", "runtime", "--entitlements", str(ent_path), str(output))
-        run("codesign", "--verify", "--deep", "--strict", str(output))
-    if sha(archive_path.read_bytes()) != original_archive_hash:
-        raise ValueError("The original app changed during this experiment")
-    report = {
-        "source": str(source), "output": str(output), "version": VERSION,
-        "bundleIdentifier": info["CFBundleIdentifier"],
-        "sourceAsarSha256": original_archive_hash,
-        "patchedAsarSha256": sha(archive), "patchedMainSha256": sha(modified_bytes),
-        "verifiedAsarEntries": checked, "patches": len(PATCHES), "revision": 2,
-        "scope": "Desktop plugin menu and five frontend plugin selectors; document read-only state and server permissions remain unchanged.",
-    }
-    (ROOT / ".local" / "patch-report.json").write_text(json.dumps(report, indent=2) + "\n")
-    (ROOT / ".local" / "patched-main.js").write_bytes(modified_bytes)
-    print(json.dumps(report, indent=2))
+    try:
+        rules = load_rules()
+        source, output = args.source.resolve(), args.output.resolve()
+        compatibility, info, header, payload, original = inspect_source(source, rules)
+        if args.check:
+            print(json.dumps(compatibility, indent=2))
+            if not compatibility["compatible"]:
+                raise SystemExit(2)
+            return
+        if not compatibility["compatible"]:
+            parser.error(
+                f"Desktop patch rules do not match Figma {compatibility['version']}. "
+                "Run --check to collect compatibility details."
+            )
+        if source == output or source in output.parents or output in source.parents:
+            parser.error("Output must be outside the source app")
+        artifacts = artifact_directory(output)
+        if output.exists():
+            if not args.refresh:
+                parser.error("Output exists; use --refresh only for a previously recorded experiment")
+            verify_refresh(output, artifacts)
+        hook_source = (ROOT / "scripts" / "plugin-access-hook.cjs").read_text()
+        modified = patch_main(original, rules, hook_source)
+        archive, header_hash = replace_main(header, payload, modified)
+        with tempfile.TemporaryDirectory(prefix="figma-plugin-patch-") as temp:
+            temp = pathlib.Path(temp)
+            js = temp / "main.js"
+            js.write_bytes(modified)
+            run("node", "--check", str(js))
+            output.parent.mkdir(parents=True, exist_ok=True)
+            if not output.exists():
+                print(f"Copying {source} to {output}", flush=True)
+                run("ditto", str(source), str(output))
+            destination_archive = output / "Contents/Resources/app.asar"
+            destination_archive.write_bytes(archive)
+            checked = verify_archive(destination_archive)
+            info["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"] = header_hash
+            info["CFBundleIdentifier"] = "local.figma.PluginExperiment"
+            info["CFBundleDisplayName"] = "Figma Plugin Experiment"
+            (output / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
+            ent_result = subprocess.run(
+                ["codesign", "-d", "--entitlements", ":-", str(source)],
+                check=True, capture_output=True,
+            )
+            entitlements = plistlib.loads(ent_result.stdout)
+            entitlements["com.apple.security.cs.disable-library-validation"] = True
+            ent_path = temp / "entitlements.plist"
+            ent_path.write_bytes(plistlib.dumps(entitlements))
+            run("codesign", "--force", "--deep", "--sign", "-", "--options", "runtime", "--entitlements", str(ent_path), str(output))
+            run("codesign", "--verify", "--deep", "--strict", str(output))
+        if sha((source / "Contents/Resources/app.asar").read_bytes()) != compatibility["sourceAsarSha256"]:
+            raise ValueError("The original app changed during this experiment")
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "original-main.js").write_bytes(original)
+        (artifacts / "patched-main.js").write_bytes(modified)
+        report = {
+            "source": str(source), "output": str(output), "version": compatibility["version"],
+            "artifactDirectory": str(artifacts),
+            "bundleIdentifier": info["CFBundleIdentifier"],
+            "sourceAsarSha256": compatibility["sourceAsarSha256"],
+            "sourceMainSha256": compatibility["sourceMainSha256"],
+            "patchedAsarSha256": sha(archive), "patchedMainSha256": sha(modified),
+            "verifiedAsarEntries": checked, "patches": len(rules), "revision": 3,
+            "scope": "Desktop plugin menu and frontend plugin selectors; document read-only state and server permissions remain unchanged.",
+        }
+        report_text = json.dumps(report, indent=2) + "\n"
+        (artifacts / "patch-report.json").write_text(report_text)
+        if output == (ROOT / ".local" / "Figma Plugin Experiment.app").resolve():
+            (ROOT / ".local" / "patch-report.json").write_text(report_text)
+        print(report_text, end="")
+    except (OSError, ValueError, KeyError, struct.error) as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":
