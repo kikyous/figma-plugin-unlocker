@@ -160,7 +160,7 @@ def inspect_source(source, rules):
         "sourceAsarSha256": sha(archive_path.read_bytes()),
         "compatible": patch_error is None,
         "patchChecks": checks, "patchError": patch_error, "verifiedAsarEntries": verified,
-        "frontend": "Checked separately against the pinned public web bundle at runtime.",
+        "frontend": "Patch rules are checked separately against the web bundle at runtime.",
     }
     return report, info, header, payload, original
 

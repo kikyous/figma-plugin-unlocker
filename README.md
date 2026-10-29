@@ -33,7 +33,7 @@ python3 scripts/patch-figma.py --check
 
 可用 `--source /path/to/Figma.app` 检查其他位置。输出包括版本、主脚本哈希和每条补丁的匹配数量；哈希仅供记录。规则不匹配时会输出 `compatible: false` 并返回退出码 `2`。规则匹配不能保证未知构建的实际行为正确。
 
-桌面应用版本和网页编辑器版本独立发布。`--check` 只检查桌面部分；网页部分仍在运行时单独核对 bundle 哈希。
+桌面应用版本和网页编辑器版本独立发布。`--check` 只检查桌面部分；网页部分在运行时单独检查每条补丁规则是否唯一匹配。
 
 ## 使用
 
@@ -102,7 +102,7 @@ node scripts/fetch-frontend.mjs
 node scripts/verify-frontend-patch.mjs
 ```
 
-也可以将本地 bundle 路径传给 `verify-frontend-patch.mjs`。下载工具在保存前验证哈希与补丁匹配情况；验证脚本检查编译结果、未知 bundle 拒绝、文档状态不变，以及其他编辑器模式、未登录状态和 Dev Mode 导出限制的原行为。
+也可以将本地 bundle 路径传给 `verify-frontend-patch.mjs`。下载工具在保存前验证补丁匹配情况；验证脚本检查编译结果、缺失或重复的补丁目标、文档状态不变，以及其他编辑器模式、未登录状态和 Dev Mode 导出限制的原行为。
 
 目前在本机实际只读文件中验证过：
 
@@ -116,4 +116,4 @@ node scripts/verify-frontend-patch.mjs
 
 共享规则使用正则捕获压缩后的名称；每条规则必须唯一匹配，否则构建会中止。如果代码结构改变，需要先适配共享规则。检查安装包后，还应验证归档、签名、菜单行为和启动；真实文件菜单与插件执行需要分别验证。
 
-新桌面版本可以复用前端补丁。若 Figma 更新了公开网页 bundle，则还需独立适配 `scripts/plugin-access-hook.cjs` 的前端规则和哈希。
+新桌面版本可以复用前端补丁。若 Figma 更新了公开网页 bundle 且现有规则不再匹配，则还需独立适配 `scripts/plugin-access-hook.cjs` 的前端规则。

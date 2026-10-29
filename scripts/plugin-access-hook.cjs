@@ -1,7 +1,5 @@
 "use strict";
 
-const { createHash } = require("node:crypto");
-const EXPECTED_BUNDLE_SHA256 = "80daabc8111778c6605df1b7f717ed42b3f9c290bc19cc9909fb2cdf1000889a";
 const normalDesign = 'e.selectedView?.view==="fullscreen"&&e.selectedView?.editorType===1';
 const PATCHES = [
   [
@@ -27,12 +25,8 @@ const PATCHES = [
 ];
 
 function patchBundle(source) {
-  const digest = createHash("sha256").update(source).digest("hex");
-  if (digest !== EXPECTED_BUNDLE_SHA256) {
-    throw new Error("Unsupported Figma frontend bundle: " + digest);
-  }
-  for (const [before, after] of PATCHES) {
-    if (source.split(before).length !== 2) throw new Error("Missing or ambiguous frontend patch");
+  for (const [index, [before, after]] of PATCHES.entries()) {
+    if (source.split(before).length !== 2) throw new Error(`Missing or ambiguous frontend patch ${index + 1}`);
     source = source.replace(before, after);
   }
   return 'globalThis.__figmaPluginAccessExperiment={version:2,pluginSelectorsPatched:true};\n' + source;
@@ -83,4 +77,4 @@ function install() {
   });
 }
 
-module.exports = { patchBundle, PATCHES, EXPECTED_BUNDLE_SHA256, install };
+module.exports = { patchBundle, PATCHES, install };

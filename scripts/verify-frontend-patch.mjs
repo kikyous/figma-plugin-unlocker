@@ -4,12 +4,17 @@ import vm from 'node:vm';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { patchBundle } = require('./plugin-access-hook.cjs');
+const { patchBundle, PATCHES } = require('./plugin-access-hook.cjs');
 const sourcePath = process.argv[2] ?? new URL('../.local/frontend/figma_app-current.js', import.meta.url);
 const source = fs.readFileSync(sourcePath, 'utf8');
 const patched = patchBundle(source);
 new vm.Script(patched);
-assert.throws(() => patchBundle(source + ' '), /Unsupported Figma frontend bundle/);
+assert.doesNotThrow(() => patchBundle(source + ' '), 'Unrelated changes should not block matching rules');
+for (const [index, [before]] of PATCHES.entries()) {
+  const error = new RegExp(`Missing or ambiguous frontend patch ${index + 1}`);
+  assert.throws(() => patchBundle(source.replace(before, '')), error);
+  assert.throws(() => patchBundle(source + before), error);
+}
 
 function permissions(text) {
   const start = text.indexOf('150206(e,t,n){');
@@ -68,4 +73,4 @@ const restrictedDevMode = state(2);
 restrictedDevMode.openFile.canExport = false;
 assert.equal(changed.Eh(restrictedDevMode), original.Eh(restrictedDevMode));
 assert.equal(changed.Eh(restrictedDevMode), false);
-console.log('Frontend verification passed: compilation, exact bundle match, normal Design plugin access, unchanged document state, other editors, anonymous access, and Dev Mode export restrictions.');
+console.log('Frontend verification passed: compilation, unique patch matches, normal Design plugin access, unchanged document state, other editors, anonymous access, and Dev Mode export restrictions.');
